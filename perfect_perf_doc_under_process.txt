@@ -1,0 +1,192 @@
+Flow for troubleshooting performance issues:
+
+SPID TO SID
+
+
+  SELECT b.spid,
+         a.sid,
+         a.serial#,
+         a.username,
+         a.osuser
+    FROM v$session a, v$process b
+   WHERE a.paddr = b.addr AND b.spid = '&spid'
+ORDER BY b.spid
+
+
+
+1) Finding bad sqls
+
+to activity OEM
+
+BAD sql  probably
+select username,sql_id, count(*) from gv$session
+where status = 'ACTIVE'
+and username not in ('SYS')
+group by username,sql_Id
+order by 3 desc;
+
+Bad sql probably
+
+select sid,serial#,username,status,sql_id,event,last_call_et,final_blocking_instance 
+from gv$session
+where username not in ('SYS')
+and status = 'ACTIVE'
+order by last_call_et desc;
+
+Find the sql if user dont have sid or serial# by checking the time of manual execution, set the time and ask the user to start the query and this output shows
+
+	select inst_id,
+		   session_id,
+		   session_serial#,
+		   force_matching_signature,
+		   sql_id,
+		   sql_exec_id,
+		   sql_exec_start,
+		   sum(1) ash_secs,
+		   min(sample_time) min_time,
+		   max(sample_time) max_time
+	  from gv$active_session_history
+	 where session_type='FOREGROUND'  
+	   and sql_exec_start > to_date('2022/01/03 19:25','YYYY/MM/DD HH24:MI')
+	 group by inst_id, session_id, session_serial#, force_matching_signature, sql_id, sql_exec_id, sql_exec_start 
+	having sum(1) > 20
+	 order by sql_exec_start;
+
+
+---------------------------------------------------------------
+
+2) Finding sql plan changes
+
+a) level3_sql.sql
+
+oldest possible plan changes ( good to bad ):
+
+select sql_id,SQL_PLAN_HASH_VALUE,SQL_EXEC_START from dba_hist_active_sess_history where sql_id='&a' order by SQL_EXEC_start desc;
+
+---------------------------------------------------------------
+
+3)  Sql PLan from awr and current cursor:
+
+SELECT * FROM table(DBMS_XPLAN.DISPLAY_CURSOR(('&sql_id')));
+SELECT * FROM table(DBMS_XPLAN. DISPLAY_AWR('&sql_id'));
+select * from table(dbms_xplan.display_cursor('&sql_id', 0, 'basic note'));
+
+---------------------------------------------------------------
+
+
+4) Current exection details of the sql statment
+
+select sql_text, sql_fulltext, executions, elapsed_time/1000000 seconds, (elapsed_time/1000000)/executions "total_time"
+from gv$sql
+where sql_id = '&a'
+order by executions desc;
+
+
+
+select sql_id, executions, elapsed_time/1000000 seconds
+from gv$sql
+where sql_id = '&a'
+order by executions desc;
+
+
+-------------------------------------------------------------
+
+5) to Flush cursor from shared pool
+
+alter system flush shared_pool;
+
+select address, hash_value from v$sqlarea where sql_id like '&a';
+
+ADDRESS          HASH_VALUE
+---------------- ----------
+00000000A9F34F98 1682024353
+
+exec dbms_shared_pool.purge('00000000A9F34F98, 1682024353','S');
+
+T  FOR TYPE
+P FOR PROCEDURE
+C FOR CURSOR
+S FOR SQL
+
+
+Lock Stats
+
+exec dbms_stats.lock_table_stats('&owner', '&table');
+
+
+Clear stats
+
+EXEC DBMS_STATS.DELETE_TABLE_STATS ('&owner','&table');
+
+--------------------------------------------------------------------------------
+
+Force Cursor Reparse
+
+create user testreparse identified by blablabla123;
+grant select, insert, update, delete on PRIX.VW_REPLACEMENT_COST_PG to testreparse;
+revoke select, insert, update, delete on PRIX.VW_REPLACEMENT_COST_PG from testreparse;
+drop user testreparse cascade;  
+
+--------------------------------------------------------------------------------
+
+Jobs running at a specific time
+
+select job, what, broken, last_date, interval from dba_jobs order by last_date;
+
+---------------------------------------------------------------------------------
+
+Tables involved in the query
+
+
+select tab_stat.tb, tab_stat.num_rows, nvl(hist.histograms,0) histograms, tab_stat.last_analyzed from
+(
+select owner||'.'||table_name tb, count(*) histograms
+       from dba_tab_columns
+ where num_buckets > 1
+group by owner||'.'||table_name
+) hist,
+(select distinct tb, num_rows, last_analyzed from (
+select distinct owner||'.'||table_name tb, num_rows, last_analyzed
+from dba_tables
+where (owner,table_name) in (select distinct object_owner, object_name
+from gv$sql_plan where sql_id = '&sql_id'
+)
+union all
+select distinct owner||'.'||table_name tb, num_rows, last_analyzed
+from dba_tables where (owner,table_name) in (select owner, table_name from dba_indexes
+where (owner, index_name) in (select distinct object_owner, object_name
+from gv$sql_plan where sql_id = '&sql_id'
+))
+)
+) tab_stat
+where hist.tb(+)=tab_stat.tb
+order by tab_stat.num_rows desc ; 
+
+-----------------------------------------------------------------------------------
+
+start the optimizer gather stats job immediately ( GTP issue )
+
+exec dbms_auto_task_immediate.gather_optimizer_stats;
+
+
+select to_char(log_date,'MM/DD/YYYY hh24:mi:ss') log_date ,job_name,status from dba_scheduler_job_log  where job_name like '%MANUAL%' and status = 'SUCCEEDED';
+
+
+select job_name,state from dba_scheduler_jobs where program_name='GATHER_STATS_PROG';
+
+
+List of objects that missed statistics:
+---------------------------------------
+
+select owner, table_name, stattype_locked from dba_tab_statistics
+where stattype_locked is not null
+and owner not in (select username from dba_users where oracle_maintained = 'Y')
+/
+
+
+
+ 
+
+
+
+
